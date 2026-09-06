@@ -376,6 +376,101 @@ step. The behaviour is unchanged and still documented in the gaps section.
 
 ## Ready for Android: what the iOS side has built
 
+### Worth knowing: Google deprecates the loopback redirect for the Android and iOS client types
+
+Not a bug, not caused by any recent change, and not urgent - but all three platforms now depend on it,
+so it should be a known risk rather than a surprise.
+
+Google's native-app OAuth guide says the loopback redirect
+(`http://localhost:PORT`) is **deprecated for the Android, Chrome app and iOS OAuth client types**,
+and supported for **Desktop app** clients on macOS, Linux and Windows. The related out-of-band
+copy/paste flow is already discontinued outright.
+
+AAPS uses one client id on every platform against `http://localhost:8080/oauth/callback`. By
+elimination it must be registered as a **Desktop app** client: an Android client type cannot use
+loopback at all, and would be tied to a package name and signing certificate, which would make it
+unusable from iOS and the desktop. A Desktop-type client is accepted whatever device presents it,
+which is why Android has worked for years and why the iOS sign in succeeded.
+
+So nothing is broken. What is worth doing is confirming the registered client type in the Cloud
+console, because that single fact decides whether this is a non-issue or a thing to plan for. Nobody
+on either session can see it from the code.
+
+Google's error guide also settles the 403 question in the shared client's favour: 401 is invalid
+credentials and should be answered by refreshing first, while 403 is permission and quota
+(`rateLimitExceeded`, `storageQuotaExceeded`, `insufficientFilePermissions`) and is **not** token
+expiry. `GoogleDriveManager` used to treat 403 as a dead sign in, so a full Drive or a rate limit
+signed the user out; the shared client does not.
+
+### Two things the Windows session found in the Drive merge
+
+Written back for the macOS session. Both are fixed; neither was visible from your side.
+
+**`IosGoogleDriveProvider` was dropping the forced token refresh.** It passed
+`accessToken = { tokenClient.validAccessToken() }`, which compiles - the lambda's `it` is the
+`forceRefresh` flag and is simply unused - so the retry a 401 triggers re-sent the *same* stale token,
+was refused again, and cleared the sign in. That is exactly the clock-skew bug the retry was added to
+prevent, reintroduced at the construction site. `GoogleDriveProviderTest` could not see it because it
+builds its own wiring rather than using the platform class.
+
+The construction is shared now: `googleDriveProvider()` in `commonMain` takes the engine and does the
+rest, so `IosGoogleDriveProvider` and `DesktopGoogleDriveProvider` are one line of engine choice each,
+and the client id is stated once. `GoogleDriveProviderFactoryTest` covers it and fails if the flag is
+dropped again - verified by putting the bug back.
+
+**Moving `CloudDirectoryManagerImpl` to `commonMain` broke the desktop build.** It carries
+`@ContributesBinding(AppScope::class)`, so it collided with `DesktopCloudDirectoryManager`
+(`[Metro/DuplicateBinding]`), and desktop contributed no `CloudStorageProvider`
+(`[Metro/MissingBinding]`). Both are `:desktop:shell` compile errors, which the macOS session never
+builds. Worth remembering: **a commonMain class with a contributed binding lands on all three shells
+at once.** Desktop is fixed - the stub is deleted and it runs the real shared manager.
+
+### Google Drive: the shared client is proven, Android is the last one not using it
+
+`GoogleDriveManager` in `implementation/androidMain` is 1400 lines, and everything it does now
+exists in `commonMain` and has been run against a real Google account from an iPhone. Moving Android
+onto it is the last piece of the Drive work, and the only reason it has not been done from the macOS
+session is that **an Android change cannot be runtime-tested there** - the SDK is installed but there
+is no system image or AVD, and the behaviour at risk is user-facing.
+
+What already exists, all shared and tested on Android, desktop and iOS:
+
+- `GoogleAuthRequest` (PKCE, pinned to the RFC 7636 vector), `GoogleTokenStore`/`GoogleTokenClient`,
+  `GoogleDriveApi` and `GoogleDriveProvider` - about 65 tests, all against Ktor's mock engine, so
+  they run with no network and no account.
+- `JvmAuthRedirectListener` in `jvmSharedMain` - the loopback socket, already compiled into the
+  Android target. `AndroidAuthRedirectListener` is a one-line binding, the way `IosAuthRedirectListener`
+  is.
+- `OAuthCallback` and `ExportMetadata`, which Android already uses.
+
+What Android still needs:
+
+1. An `AuthBrowser` - a Custom Tab. **Not** the plain "open a link" opener: the sign in ends with a
+   redirect to a port this app is listening on, and a browser that switches away lets the OS suspend
+   the app and take the listener with it. Android is more forgiving than iOS here, but the shape is
+   the same and the interface's KDoc explains it.
+2. Construction, contributed into the `CloudStorageProvider` set. `IosGoogleDriveProvider` is thirty
+   lines and is the worked example.
+3. The behaviour `GoogleDriveManager` has and the shared provider does not: it raises **user-visible
+   notifications** on connection errors and pulls resource strings for them, where the shared one
+   keeps an in-memory flag and lets the caller decide what to show. That is the part worth reviewing
+   rather than porting mechanically - it is the only real behaviour difference, and it is the reason
+   a straight swap is not obviously safe for existing users.
+
+Three traps already paid for on the iOS side, all fixed in shared code, none of them obvious:
+
+- **Stored key names must be the ones Android already writes.** A name invented for the folder
+  (`google_drive_selected_folder_id` instead of `google_drive_folder_id`) kept the user signed in and
+  silently lost the folder they chose, so the next export went to the root of their Drive.
+  `GoogleDriveProviderTest` now asserts the *complete* set of stored names, not individual ones -
+  checking three of them is what let the fourth through.
+- **A 401 is not always a dead sign in.** It often just means the access token went stale early, so
+  it is retried with a forced refresh before the credentials are cleared.
+- **The sign in wait was sixty seconds.** That expires while a person is still typing a password, and
+  when it does the listener closes, so the redirect that arrives a moment later hits a dead port. It
+  is `AUTH_WAIT_MS` now, five minutes, shared - Android had the same bug, less visibly.
+
+
 - **`NsLoadExecutor` is done** - `CoroutineNsLoadExecutor` in `plugins/sync/iosMain`. The nine steps
   run as a coroutine sequence under one `Job`, so a new round replaces one in flight. Two details
   worth keeping if it is ever moved to `commonMain`: the chain stops at the first step that does not
