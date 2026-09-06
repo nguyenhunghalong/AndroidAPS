@@ -77,6 +77,32 @@ jobs:
           # describe against.
           fetch-depth: 0
 
+      # First, before the tests and the Kotlin/Native build, because everything after this needs the
+      # credentials and none of it says so. The first run of this workflow spent 114 minutes building
+      # and then failed inside `xcodebuild` with a bare "exit code 64" - a usage error, because an
+      # empty `-authenticationKeyID` is a malformed argument rather than a missing secret. Nothing
+      # before it complained: writing an empty key file and an empty team id both succeed.
+      #
+      # Only emptiness is checked, never a value, so nothing about a secret can reach the log.
+      - name: Check the signing secrets are present
+        env:
+          KEY: ${{ secrets.APP_STORE_CONNECT_PRIVATE_KEY }}
+          KEY_ID: ${{ secrets.APP_STORE_CONNECT_KEY_ID }}
+          ISSUER_ID: ${{ secrets.APP_STORE_CONNECT_ISSUER_ID }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          missing=""
+          [ -n "$KEY" ]           || missing="$missing APP_STORE_CONNECT_PRIVATE_KEY"
+          [ -n "$KEY_ID" ]        || missing="$missing APP_STORE_CONNECT_KEY_ID"
+          [ -n "$ISSUER_ID" ]     || missing="$missing APP_STORE_CONNECT_ISSUER_ID"
+          [ -n "$APPLE_TEAM_ID" ] || missing="$missing APPLE_TEAM_ID"
+          if [ -n "$missing" ]; then
+            echo "::error::Missing secrets in the 'testflight' environment:$missing"
+            echo "Set them on the environment, not the repository, or this job cannot see them."
+            exit 1
+          fi
+          echo "All four signing secrets are present."
+
       - name: Load jdk version
         run: |
           JAVA_VERSION=$(jq -r '.default' .github/jdk-map.json)
